@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from freqtrade.constants import CUSTOM_TAG_MAX_LENGTH, DATETIME_PRINT_FORMAT
-from freqtrade.enums import TradingMode
+from freqtrade.enums import ConditionalTriggerType, OrderRole, TradingMode
 from freqtrade.exceptions import DependencyException
 from freqtrade.exchange.exchange_utils import TICK_SIZE
 from freqtrade.persistence import LocalTrade, Order, Trade, init_db
@@ -2114,6 +2114,49 @@ def test_select_order(fee, is_short):
     order = trades[4].select_order("stoploss", None)
     assert order is not None
     assert order.ft_order_side == "stoploss"
+
+
+@pytest.mark.usefixtures("init_persistence")
+@pytest.mark.parametrize("is_short", [True, False])
+def test_order_role_helpers(fee, is_short):
+    create_mock_trades(fee, is_short)
+
+    trades = Trade.get_trades().all()
+    entry_order = trades[1].orders[0]
+    exit_order = trades[1].orders[1]
+    conditional_exit_order = trades[4].orders[1]
+
+    assert trades[1].get_order_role(entry_order) == OrderRole.entry
+    assert trades[1].is_entry_order(entry_order) is True
+    assert trades[1].is_position_exit_order(entry_order) is False
+
+    assert trades[1].get_order_role(exit_order) == OrderRole.exit
+    assert trades[1].is_exit_order(exit_order) is True
+    assert trades[1].is_position_exit_order(exit_order) is True
+
+    assert trades[4].get_order_role(conditional_exit_order) == OrderRole.conditional_exit
+    assert conditional_exit_order.ft_is_conditional_exit is True
+    assert trades[4].is_position_exit_order(conditional_exit_order) is True
+    assert conditional_exit_order.ft_conditional_trigger_type == ConditionalTriggerType.stop_loss
+    assert trades[4].order_has_role(conditional_exit_order, "stoploss") is True
+    assert trades[4].order_has_role(conditional_exit_order, OrderRole.conditional_exit) is True
+
+    assert trades[1].select_order_by_role(OrderRole.entry, False) == entry_order
+    assert trades[1].select_order_by_role(OrderRole.exit, False) == exit_order
+    assert (
+        trades[4].select_order_by_role(OrderRole.conditional_exit, True) == conditional_exit_order
+    )
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_select_filled_orders_by_role(fee):
+    create_mock_trades(fee)
+
+    trades = Trade.get_trades().all()
+
+    assert len(trades[1].select_filled_orders_by_role(OrderRole.entry)) == 1
+    assert len(trades[1].select_filled_orders_by_role(OrderRole.exit)) == 1
+    assert len(trades[4].select_filled_orders_by_role(OrderRole.conditional_exit)) == 0
 
 
 def test_Trade_object_idem():

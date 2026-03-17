@@ -127,12 +127,10 @@ class Wallets:
             for trade in open_trades:
                 curr = self._exchange.get_pair_base_currency(trade.pair)
                 used_stake += sum(
-                    o.stake_amount for o in trade.open_orders if o.ft_order_side == trade.entry_side
+                    o.stake_amount for o in trade.open_orders if trade.is_entry_order(o)
                 )
                 pending = sum(
-                    o.amount
-                    for o in trade.open_orders
-                    if o.amount and o.ft_order_side == trade.exit_side
+                    o.amount for o in trade.open_orders if o.amount and trade.is_exit_order(o)
                 )
                 curr_wallet_bal = self._start_cap.get(curr, 0)
 

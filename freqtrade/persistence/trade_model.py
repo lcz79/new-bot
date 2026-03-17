@@ -35,7 +35,7 @@ from freqtrade.constants import (
     BuySell,
     LongShort,
 )
-from freqtrade.enums import ExitType, TradingMode
+from freqtrade.enums import ConditionalTriggerType, ExitType, OrderRole, TradingMode
 from freqtrade.exceptions import DependencyException, OperationalException
 from freqtrade.exchange import (
     ROUND_DOWN,
@@ -88,7 +88,9 @@ class Order(ModelBase):
     _trade_live: Mapped["Trade"] = relationship("Trade", back_populates="orders", lazy="immediate")
     _trade_bt: "LocalTrade" = None  # type: ignore
 
-    # order_side can only be 'buy', 'sell' or 'stoploss'
+    # Internal order role. Exchange-facing order side remains available on `side`.
+    # Existing values are 'buy', 'sell' or 'stoploss', where 'stoploss' is currently
+    # used for exchange trigger-based exit orders.
     ft_order_side: Mapped[str] = mapped_column(String(25), nullable=False)
     ft_pair: Mapped[str] = mapped_column(String(25), nullable=False)
     ft_is_open: Mapped[bool] = mapped_column(nullable=False, default=True, index=True)
@@ -169,6 +171,23 @@ class Order(ModelBase):
         return self._trade_bt or self._trade_live
 
     @property
+    def ft_is_conditional_exit(self) -> bool:
+        """
+        True for exchange-native conditional exit orders.
+        Currently this maps to stoploss trigger orders.
+        """
+        return self.ft_order_side == "stoploss"
+
+    @property
+    def ft_conditional_trigger_type(self) -> ConditionalTriggerType | None:
+        """
+        Exchange trigger type for conditional exit orders.
+        """
+        if self.ft_is_conditional_exit:
+            return ConditionalTriggerType.stop_loss
+        return None
+
+    @property
     def stake_amount(self) -> float:
         """Amount in stake currency used for this order"""
         return float(
@@ -237,7 +256,7 @@ class Order(ModelBase):
             "amount": self.amount,
             "cost": self.cost,
             "type": self.order_type,
-            "side": self.ft_order_side,
+            "side": self.side or self.ft_order_side,
             "filled": self.filled,
             "remaining": self.remaining,
             "datetime": self.order_date_utc.strftime("%Y-%m-%dT%H:%M:%S.%f"),
@@ -246,11 +265,13 @@ class Order(ModelBase):
             "fee": None,
             "info": {},
         }
-        if self.ft_order_side == "stoploss":
+        if self.ft_is_conditional_exit:
             order.update(
                 {
                     stopPriceName: self.stop_price,
                     "ft_order_type": "stoploss",
+                    "ft_order_role": OrderRole.conditional_exit.value,
+                    "ft_trigger_type": self.ft_conditional_trigger_type.value,
                 }
             )
 
@@ -312,7 +333,7 @@ class Order(ModelBase):
         self.funding_fee = trade.funding_fee_running
         trade.funding_fee_running = 0.0
 
-        if self.ft_order_side == trade.entry_side and self.price:
+        if trade.is_entry_order(self) and self.price:
             trade.open_rate = self.price
             trade.recalc_trade_from_orders()
             if trade.nr_of_successful_entries == 1:
@@ -534,8 +555,14 @@ class LocalTrade:
 
     @property
     def stoploss_last_update_utc(self):
-        if self.has_open_sl_orders:
-            return max(o.order_date_utc for o in self.open_sl_orders)
+        if self.has_open_conditional_exit_orders:
+            return max(o.order_date_utc for o in self.open_conditional_exit_orders)
+        return None
+
+    @property
+    def conditional_exit_last_update_utc(self):
+        if self.has_open_conditional_exit_orders:
+            return max(o.order_date_utc for o in self.open_conditional_exit_orders)
         return None
 
     @property
@@ -586,19 +613,19 @@ class LocalTrade:
     @property
     def open_orders(self) -> list[Order]:
         """
-        All open orders for this trade excluding stoploss orders
+        All open orders for this trade excluding conditional exit orders.
         """
-        return [o for o in self.orders if o.ft_is_open and o.ft_order_side != "stoploss"]
+        return [o for o in self.orders if o.ft_is_open and not o.ft_is_conditional_exit]
 
     @property
     def has_open_orders(self) -> bool:
         """
-        True if there are open orders for this trade excluding stoploss orders
+        True if there are open orders for this trade excluding conditional exit orders.
         """
-        open_orders_wo_sl = [
-            o for o in self.orders if o.ft_order_side not in ["stoploss"] and o.ft_is_open
+        open_standard_orders = [
+            o for o in self.orders if not o.ft_is_conditional_exit and o.ft_is_open
         ]
-        return len(open_orders_wo_sl) > 0
+        return len(open_standard_orders) > 0
 
     @property
     def has_open_position(self) -> bool:
@@ -608,33 +635,49 @@ class LocalTrade:
         return self.amount > 0
 
     @property
+    def open_conditional_exit_orders(self) -> list[Order]:
+        """
+        All open conditional exit orders for this trade.
+        Currently this means stoploss trigger orders.
+        """
+        return [o for o in self.orders if o.ft_is_conditional_exit and o.ft_is_open]
+
+    @property
+    def has_open_conditional_exit_orders(self) -> bool:
+        """
+        True if there are open conditional exit orders for this trade.
+        """
+        open_conditional_exit_orders = [
+            o for o in self.orders if o.ft_is_conditional_exit and o.ft_is_open
+        ]
+        return len(open_conditional_exit_orders) > 0
+
+    @property
+    def conditional_exit_orders(self) -> list[Order]:
+        """
+        All conditional exit orders for this trade.
+        """
+        return [o for o in self.orders if o.ft_is_conditional_exit]
+
+    @property
     def open_sl_orders(self) -> list[Order]:
-        """
-        All open stoploss orders for this trade
-        """
-        return [o for o in self.orders if o.ft_order_side in ["stoploss"] and o.ft_is_open]
+        """Compatibility alias for open stoploss orders."""
+        return self.open_conditional_exit_orders
 
     @property
     def has_open_sl_orders(self) -> bool:
-        """
-        True if there are open stoploss orders for this trade
-        """
-        open_sl_orders = [
-            o for o in self.orders if o.ft_order_side in ["stoploss"] and o.ft_is_open
-        ]
-        return len(open_sl_orders) > 0
+        """Compatibility alias for open stoploss orders."""
+        return self.has_open_conditional_exit_orders
 
     @property
     def sl_orders(self) -> list[Order]:
-        """
-        All stoploss orders for this trade
-        """
-        return [o for o in self.orders if o.ft_order_side in ["stoploss"]]
+        """Compatibility alias for stoploss orders."""
+        return self.conditional_exit_orders
 
     @property
     def open_orders_ids(self) -> list[str]:
         open_orders_ids_wo_sl = [
-            oo.order_id for oo in self.open_orders if oo.ft_order_side not in ["stoploss"]
+            oo.order_id for oo in self.open_orders if not oo.ft_is_conditional_exit
         ]
         return open_orders_ids_wo_sl
 
@@ -894,13 +937,13 @@ class LocalTrade:
             return
 
         logger.info(f"Updating trade (id={self.id}) ...")
-        if order.ft_order_side != "stoploss":
+        if not order.ft_is_conditional_exit:
             order.funding_fee = self.funding_fee_running
             # Reset running funding fees
             self.funding_fee_running = 0.0
         order_type = order.order_type.upper() if order.order_type else None
 
-        if order.ft_order_side == self.entry_side:
+        if self.is_entry_order(order):
             # Update open rate and actual amount
             self.open_rate = order.safe_price
             self.amount = order.safe_amount_after_fee
@@ -909,13 +952,13 @@ class LocalTrade:
                 logger.info(f"{order_type}_{payment} has been fulfilled for {self}.")
 
             self.recalc_trade_from_orders()
-        elif order.ft_order_side == self.exit_side:
+        elif self.is_exit_order(order):
             if self.is_open:
                 payment = "BUY" if self.is_short else "SELL"
                 # * On margin shorts, you buy a little bit more than the amount (amount + interest)
                 logger.info(f"{order_type}_{payment} has been fulfilled for {self}.")
 
-        elif order.ft_order_side == "stoploss" and order.status not in ("open",):
+        elif order.ft_is_conditional_exit and order.status not in ("open",):
             self.close_rate_requested = self.stop_loss
             self.exit_reason = ExitType.STOPLOSS_ON_EXCHANGE.value
             if self.is_open and order.safe_filled > 0:
@@ -923,7 +966,7 @@ class LocalTrade:
         else:
             raise ValueError(f"Unknown order type: {order.order_type}")
 
-        if order.ft_order_side != self.entry_side:
+        if not self.is_entry_order(order):
             amount_tr = amount_to_contract_precision(
                 self.amount, self.amount_precision, self.precision_mode, self.contract_size
             )
@@ -952,6 +995,44 @@ class LocalTrade:
                 f"Marking {self} as closed as the trade is fulfilled "
                 "and found no open orders for it."
             )
+
+    def get_order_role(self, order: Order) -> OrderRole:
+        """
+        Resolve the semantic role for an order within this trade.
+        :param order: Order object to inspect.
+        :return: Internal order role.
+        """
+        if order.ft_is_conditional_exit:
+            return OrderRole.conditional_exit
+        if order.ft_order_side == self.entry_side:
+            return OrderRole.entry
+        if order.ft_order_side == self.exit_side:
+            return OrderRole.exit
+        raise ValueError(f"Unknown order type: {order.order_type}")
+
+    def order_has_role(self, order: Order, order_role: OrderRole | str) -> bool:
+        """
+        Check whether an order matches the provided semantic role.
+        :param order: Order object to inspect.
+        :param order_role: Internal order role ('entry', 'exit', 'conditional_exit').
+        :return: True if the role matches.
+        """
+        if order_role in (OrderRole.entry, OrderRole.entry.value):
+            return self.is_entry_order(order)
+        if order_role in (OrderRole.exit, OrderRole.exit.value):
+            return self.is_exit_order(order)
+        if order_role in (OrderRole.conditional_exit, OrderRole.conditional_exit.value, "stoploss"):
+            return order.ft_is_conditional_exit
+        return False
+
+    def is_entry_order(self, order: Order) -> bool:
+        return self.get_order_role(order) == OrderRole.entry
+
+    def is_exit_order(self, order: Order) -> bool:
+        return self.get_order_role(order) == OrderRole.exit
+
+    def is_position_exit_order(self, order: Order) -> bool:
+        return self.get_order_role(order) in (OrderRole.exit, OrderRole.conditional_exit)
 
     def update_fee(
         self, fee_cost: float, fee_currency: str | None, fee_rate: float | None, side: str
@@ -1000,9 +1081,7 @@ class LocalTrade:
             [
                 o
                 for o in self.orders
-                if o.ft_order_side == self.entry_side
-                and o.status in CANCELED_EXCHANGE_STATES
-                and o.filled == 0
+                if self.is_entry_order(o) and o.status in CANCELED_EXCHANGE_STATES and o.filled == 0
             ]
         )
 
@@ -1016,7 +1095,7 @@ class LocalTrade:
             [
                 o
                 for o in self.orders
-                if o.ft_order_side == self.exit_side and o.status in CANCELED_EXCHANGE_STATES
+                if self.is_exit_order(o) and o.status in CANCELED_EXCHANGE_STATES
             ]
         )
 
@@ -1257,7 +1336,7 @@ class LocalTrade:
             tmp_amount = FtPrecise(o.safe_amount_after_fee)
             tmp_price = FtPrecise(o.safe_price)
 
-            is_exit = o.ft_order_side != self.entry_side
+            is_exit = self.is_position_exit_order(o)
             side = FtPrecise(-1 if is_exit else 1)
             if tmp_amount > ZERO and tmp_price is not None:
                 current_amount += tmp_amount * side
@@ -1350,6 +1429,28 @@ class LocalTrade:
         else:
             return None
 
+    def select_order_by_role(
+        self,
+        order_role: OrderRole | str,
+        is_open: bool | None = None,
+        only_filled: bool = False,
+    ) -> Order | None:
+        """
+        Finds latest order for a semantic order role and status.
+        :param order_role: Internal order role ('entry', 'exit', 'conditional_exit').
+        :param is_open: Only search for open orders?
+        :param only_filled: Only search for filled orders (only valid with is_open=False).
+        :return: latest Order object if it exists, else None
+        """
+        orders = [o for o in self.orders if self.order_has_role(o, order_role)]
+        if is_open is not None:
+            orders = [o for o in orders if o.ft_is_open == is_open]
+        if is_open is False and only_filled:
+            orders = [o for o in orders if o.filled and o.status in NON_OPEN_EXCHANGE_STATES]
+        if len(orders) > 0:
+            return orders[-1]
+        return None
+
     def select_filled_orders(self, order_side: str | None = None) -> list["Order"]:
         """
         Finds filled orders for this order side.
@@ -1361,6 +1462,21 @@ class LocalTrade:
             o
             for o in self.orders
             if ((o.ft_order_side == order_side) or (order_side is None))
+            and o.ft_is_open is False
+            and o.filled
+            and o.status in NON_OPEN_EXCHANGE_STATES
+        ]
+
+    def select_filled_orders_by_role(self, order_role: OrderRole | str) -> list["Order"]:
+        """
+        Finds filled orders for an internal order role.
+        :param order_role: Internal order role ('entry', 'exit', 'conditional_exit').
+        :return: array of Order objects
+        """
+        return [
+            o
+            for o in self.orders
+            if self.order_has_role(o, order_role)
             and o.ft_is_open is False
             and o.filled
             and o.status in NON_OPEN_EXCHANGE_STATES
@@ -1426,7 +1542,7 @@ class LocalTrade:
         :return: int count of entry orders that have been filled for this trade.
         """
 
-        return len(self.select_filled_orders(self.entry_side))
+        return len(self.select_filled_orders_by_role(OrderRole.entry))
 
     @property
     def nr_of_successful_exits(self) -> int:
@@ -1434,7 +1550,7 @@ class LocalTrade:
         Helper function to count the number of exit orders that have been filled.
         :return: int count of exit orders that have been filled for this trade.
         """
-        return len(self.select_filled_orders(self.exit_side))
+        return len(self.select_filled_orders_by_role(OrderRole.exit))
 
     @property
     def nr_of_successful_buys(self) -> int:
